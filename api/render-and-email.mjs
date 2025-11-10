@@ -16,7 +16,6 @@ const LANGS = {
   zh: { template: "template-zh.png", emergency: "紧急联系人：", subject: "过敏卡已生成", emailLine: ()=>"您的过敏卡已生成。" }
 };
 
-// positions for the ✖ marks (tweak if needed to match your PNGs)
 const marks = {
   eggs:        { x: 170, y: 250 },
   dairy:       { x: 520, y: 250 },
@@ -27,26 +26,19 @@ const marks = {
 };
 
 function buildOverlaySVG({ width, height, name, allergens, emergencyText }) {
-  // Build little SVG text layers we can composite over the PNG
   const xs = Object.entries(marks).map(([key, pos]) => {
     if (!allergens.includes(key)) return "";
-    // SVG <text> baseline is different from canvas, so nudge a bit
     return `<text x="${pos.x}" y="${pos.y}" font-family="Open Sans, Arial, sans-serif" font-weight="700" font-size="64" fill="#111">✖</text>`;
   }).join("");
 
   return Buffer.from(`
     <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <!-- Name -->
       <text x="${width/2}" y="95" text-anchor="middle"
             font-family="Open Sans, Arial, sans-serif"
             font-weight="700" font-size="72" fill="#111">
         ${String(name || "").toUpperCase()}
       </text>
-
-      <!-- X marks -->
       ${xs}
-
-      <!-- Emergency bar text (left aligned) -->
       <text x="125" y="${height - 45}"
             font-family="Open Sans, Arial, sans-serif"
             font-weight="700" font-size="40" fill="#ffffff">
@@ -62,46 +54,29 @@ export default async function handler(req, res) {
     if (!process.env.RESEND_API_KEY) return res.status(500).json({ error: "Missing RESEND_API_KEY env var" });
     if (!FROM_EMAIL) return res.status(500).json({ error: "Missing EMAIL_FROM env var" });
 
-    let {
-      email = "",
-      name = "",
-      allergens = [],
-      contact_name = "",
-      contact_phone = "",
-      language = "en"
-    } = req.body || {};
+    let { email = "", name = "", allergens = [], contact_name = "", contact_phone = "", language = "en" } = req.body || {};
     if (!email) return res.status(400).json({ error: "Missing recipient email" });
 
-+    console.log("DEBUG start send", {
-+      from: FROM_EMAIL,
-+      to: email.slice(0, 3) + "***",       // partial for privacy
-+      keyPrefix: (process.env.RESEND_API_KEY || "").slice(0, 5)
-+    });
-    
     language = (language || "en").toLowerCase();
     const L = LANGS[language] ? language : "en";
     if (typeof allergens === "string") {
       allergens = allergens.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
     }
 
-    // load base PNG from /assets
     const tplUrl = new URL(`../assets/${LANGS[L].template}`, import.meta.url);
     const basePng = await readFile(tplUrl);
     const baseImg = sharp(basePng);
     const meta = await baseImg.metadata();
     const { width = 1024, height = 576 } = meta;
 
-    // Build overlay SVG
     const emergencyText = `${LANGS[L].emergency} ${contact_name} ${contact_phone}`;
     const overlay = buildOverlaySVG({ width, height, name, allergens, emergencyText });
 
-    // Composite SVG over base PNG
     const pngBuffer = await baseImg
       .composite([{ input: overlay, top: 0, left: 0 }])
       .png()
       .toBuffer();
 
-    // Send email with attachment
     const subject = LANGS[L].subject;
     const html = `
       <div style="font-family: Arial, sans-serif; line-height:1.45">
@@ -110,22 +85,26 @@ export default async function handler(req, res) {
       </div>
     `;
 
-    const emailResp = await resend.emails.send({
-    +    const emailResp = await resend.emails.send({  
+    const { data, error } = await resend.emails.send({
       from: FROM_EMAIL,
       to: email,
       subject,
       html,
       attachments: [
-        { filename: `allergy-card-${L}.png`, content: pngBuffer.toString("base64"), contentType: "image/png" }
+        { filename: \`allergy-card-\${L}.png\`, content: pngBuffer.toString("base64"), contentType: "image/png" }
       ]
     });
-    +    console.log("DEBUG resend response", emailResp);
 
-    return res.status(200).json({ ok: true, emailed_to: email, messageId: emailResp?.id || null });
+    console.log("DEBUG resend result:", { hasData: !!data, hasError: !!error, errorMessage: error?.message });
+
+    if (error) {
+      return res.status(500).json({ ok: false, source: "resend", message: error.message || String(error) });
+    }
+
+    return res.status(200).json({ ok: true, emailed_to: email, messageId: data?.id || null });
+
   } catch (e) {
-    console.error("SERVER ERROR:", e?.message || e);
-    return res.status(500).json({ ok: false, error: e?.message || "Render or email failed" });
+    console.error("SERVER ERROR:", e?.stack || e?.message || e);
+    return res.status(500).json({ ok: false, source: "server", message: e?.message || "Render or email failed" });
   }
 }
-
