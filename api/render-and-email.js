@@ -1,7 +1,7 @@
 import { createCanvas, loadImage, registerFont } from "@napi-rs/canvas";
 import { Resend } from "resend";
 
-export const config = { runtime: "nodejs" };
+
 
 
 // Email + optional image hosting
@@ -159,5 +159,6 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: "Render or email failed" });
   }
 }
+
 
 
