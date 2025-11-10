@@ -1,7 +1,8 @@
 import { createCanvas, loadImage, registerFont } from "@napi-rs/canvas";
 import { Resend } from "resend";
 
-export const config = { runtime: "nodejs18.x" };
+export const config = { runtime: "nodejs" };
+
 
 // Email + optional image hosting
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -158,4 +159,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: "Render or email failed" });
   }
 }
+
 
