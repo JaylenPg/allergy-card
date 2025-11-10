@@ -1,58 +1,68 @@
 import { createCanvas, loadImage, registerFont } from "@napi-rs/canvas";
+import { readFile } from "fs/promises";
+import { fileURLToPath } from "url";
 import { Resend } from "resend";
 
+export const config = { runtime: "nodejs" };
 
-
-
-// Email + optional image hosting
+// ---- env + client ----
 const resend = new Resend(process.env.RESEND_API_KEY);
-const FROM_EMAIL = process.env.EMAIL_FROM || "no-reply@example.com";
-const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;          // optional
-const UPLOAD_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET;    // optional
+const FROM_EMAIL = process.env.EMAIL_FROM || "Jaylen <jaylen@onresend.com>";
 
-// Use Open Sans (your files are in /assets)
-registerFont("./assets/OpenSans-Bold.ttf", { family: "Open Sans", weight: "700" });
-registerFont("./assets/OpenSans-Regular.ttf", { family: "Open Sans", weight: "400" });
-
-// Language map (template image + label + email copy)
+// ---- language map (filenames only) ----
 const LANGS = {
   en: {
-    template: "./assets/template-en.png",
+    template: "template-en.png",
     emergency: "Emergency Contact:",
     subject: "Your Allergy Card",
     emailLine: (n) => `Hi ${n || "there"}, your allergy card is ready.`
   },
   fr: {
-    template: "./assets/template-fr.png",
+    template: "template-fr.png",
     emergency: "Contact d’urgence :",
     subject: "Votre carte d’allergies",
     emailLine: (n) => `Bonjour ${n || ""}, votre carte d’allergies est prête.`
   },
   es: {
-    template: "./assets/template-es.png",
+    template: "template-es.png",
     emergency: "Contacto de emergencia:",
     subject: "Tu tarjeta de alergias",
     emailLine: (n) => `Hola ${n || ""}, tu tarjeta de alergias está lista.`
   },
   pt: {
-    template: "./assets/template-pt.png",
+    template: "template-pt.png",
     emergency: "Contacto de emergência:",
     subject: "Seu cartão de alergias",
     emailLine: (n) => `Olá ${n || ""}, seu cartão de alergias está pronto.`
   },
   zh: {
-    template: "./assets/template-zh.png",
+    template: "template-zh.png",
     emergency: "紧急联系人：",
     subject: "过敏卡已生成",
     emailLine: () => "您的过敏卡已生成。"
   }
 };
 
+// ---- absolute paths to assets (works on Vercel) ----
+const fontBoldPath = fileURLToPath(new URL("../assets/OpenSans-Bold.ttf", import.meta.url));
+const fontRegPath  = fileURLToPath(new URL("../assets/OpenSans-Regular.ttf", import.meta.url));
+registerFont(fontBoldPath, { family: "Open Sans", weight: "700" });
+registerFont(fontRegPath,  { family: "Open Sans", weight: "400" });
+
 export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "POST only" });
+    }
+    // ---- validate env ----
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ error: "Missing RESEND_API_KEY env var" });
+    }
+    if (!FROM_EMAIL) {
+      return res.status(500).json({ error: "Missing EMAIL_FROM env var" });
+    }
 
-    // ---- 1) Read form data ----
+    // ---- read input ----
     let {
       email = "",
       name = "",
@@ -71,19 +81,23 @@ export default async function handler(req, res) {
       allergens = allergens.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
     }
 
-    // ---- 2) Draw image from template ----
-    const base = await loadImage(LANGS[L].template);
-    const canvas = createCanvas(base.width, base.height);
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(base, 0, 0);
+    // ---- load template image from /assets using absolute URL ----
+    const tplUrl = new URL(`../assets/${LANGS[L].template}`, import.meta.url);
+    const baseBytes = await readFile(tplUrl);
+    const baseImg = await loadImage(baseBytes);
 
-    // Name (title)
+    // ---- draw canvas ----
+    const canvas = createCanvas(baseImg.width, baseImg.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(baseImg, 0, 0);
+
+    // Name
     ctx.fillStyle = "#111";
     ctx.textAlign = "center";
     ctx.font = "700 72px Open Sans";
-    ctx.fillText((name || "").toUpperCase(), base.width / 2, 95);
+    ctx.fillText((name || "").toUpperCase(), baseImg.width / 2, 95);
 
-    // Allergen X marks (adjust x/y if needed to match your PNGs)
+    // X marks
     const marks = {
       eggs:        { x: 170, y: 250 },
       dairy:       { x: 520, y: 250 },
@@ -92,7 +106,6 @@ export default async function handler(req, res) {
       shellfish:   { x: 520, y: 380 },
       soy:         { x: 870, y: 380 }
     };
-
     ctx.font = "700 64px Open Sans";
     for (const key of Object.keys(marks)) {
       if (allergens.includes(key)) {
@@ -101,35 +114,20 @@ export default async function handler(req, res) {
       }
     }
 
-    // Red bar text — translated label + contact
+    // Emergency bar text
     ctx.textAlign = "left";
     ctx.font = "700 40px Open Sans";
     ctx.fillStyle = "#fff";
-    const emergency = LANGS[L].emergency;
-    ctx.fillText(`${emergency} ${contact_name} ${contact_phone}`, 125, base.height - 45);
+    ctx.fillText(`${LANGS[L].emergency} ${contact_name} ${contact_phone}`, 125, baseImg.height - 45);
 
     const pngBuffer = canvas.toBuffer("image/png");
 
-    // ---- 3) Optional: upload for a public URL (Cloudinary) ----
-    let publicUrl = "";
-    if (CLOUD_NAME && UPLOAD_PRESET) {
-      const b64 = `data:image/png;base64,${pngBuffer.toString("base64")}`;
-      const resp = await fetch(`https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ file: b64, upload_preset: UPLOAD_PRESET })
-      });
-      const json = await resp.json();
-      if (json.secure_url) publicUrl = json.secure_url;
-    }
-
-    // ---- 4) Email the user (Resend) ----
+    // ---- send email ----
     const subject = LANGS[L].subject;
     const html = `
       <div style="font-family:'Open Sans',Arial,sans-serif;line-height:1.45">
         <p>${LANGS[L].emailLine(name)}</p>
-        ${publicUrl ? `<p><a href="${publicUrl}">View / download the image</a></p>` : ""}
-        <p>We've also attached the PNG.</p>
+        <p>We’ve attached your PNG allergy card.</p>
       </div>
     `;
 
@@ -150,15 +148,11 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       emailed_to: email,
-      url: publicUrl || null,
       messageId: emailResp?.id || null
     });
 
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ ok: false, error: "Render or email failed" });
+    console.error("SERVER ERROR:", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || "Render or email failed" });
   }
 }
-
-
-
