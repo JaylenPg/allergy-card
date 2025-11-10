@@ -72,6 +72,12 @@ export default async function handler(req, res) {
     } = req.body || {};
     if (!email) return res.status(400).json({ error: "Missing recipient email" });
 
++    console.log("DEBUG start send", {
++      from: FROM_EMAIL,
++      to: email.slice(0, 3) + "***",       // partial for privacy
++      keyPrefix: (process.env.RESEND_API_KEY || "").slice(0, 5)
++    });
+    
     language = (language || "en").toLowerCase();
     const L = LANGS[language] ? language : "en";
     if (typeof allergens === "string") {
@@ -105,6 +111,7 @@ export default async function handler(req, res) {
     `;
 
     const emailResp = await resend.emails.send({
+    +    const emailResp = await resend.emails.send({  
       from: FROM_EMAIL,
       to: email,
       subject,
@@ -113,6 +120,7 @@ export default async function handler(req, res) {
         { filename: `allergy-card-${L}.png`, content: pngBuffer.toString("base64"), contentType: "image/png" }
       ]
     });
+    +    console.log("DEBUG resend response", emailResp);
 
     return res.status(200).json({ ok: true, emailed_to: email, messageId: emailResp?.id || null });
   } catch (e) {
@@ -120,3 +128,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: e?.message || "Render or email failed" });
   }
 }
+
