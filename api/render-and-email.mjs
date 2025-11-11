@@ -6,19 +6,15 @@ import OpenAI from "openai";
 const KNOWN_ALLERGENS = ["eggs", "dairy", "peanuts", "tree_nuts", "shellfish", "soy"];
 const SUPPORTED_LANGS = ["en", "fr", "es", "pt", "zh"];
 
-// Optional: allow browser-based testing tools (Hoppscotch etc.)
+// CORS for browser tests
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// Helpers to keep things safe
 function normalizeAllergensFromBody(body) {
-  // 1) If we directly have "allergens" as array or string
   const direct = body?.allergens;
-
-  // Accept array or comma-separated string
   if (Array.isArray(direct)) {
     const norm = direct
       .map(s => String(s).trim().toLowerCase().replace(/\s+/g, "_"))
@@ -33,18 +29,14 @@ function normalizeAllergensFromBody(body) {
     if (norm.length) return norm;
   }
 
-  // 2) Gather “checkbox per allergen” pattern:
-  // e.g. allergens_eggs: "on", allergens_dairy: "on"
   const fields = body || {};
   const fromCheckboxes = Object.keys(fields)
-    .filter(k => k.startsWith("allergens_") && fields[k]) // truthy means checked
+    .filter(k => k.startsWith("allergens_") && fields[k])
     .map(k => k.replace("allergens_", "").toLowerCase());
 
-  const cleanFromCheckboxes = fromCheckboxes
+  return fromCheckboxes
     .map(v => v.replace(/\s+/g, "_"))
     .filter(v => KNOWN_ALLERGENS.includes(v));
-
-  return cleanFromCheckboxes;
 }
 
 function normalizeLanguage(lang) {
@@ -52,7 +44,6 @@ function normalizeLanguage(lang) {
   return SUPPORTED_LANGS.includes(v) ? v : "en";
 }
 
-// Build a simple fallback card if OpenAI fails for any reason
 function fallbackCard({ name, allergens, contact_name, contact_phone, language }) {
   const allergenList =
     allergens.length ? allergens.join(", ").replace(/_/g, " ") : "None specified";
@@ -66,11 +57,13 @@ function fallbackCard({ name, allergens, contact_name, contact_phone, language }
   return lines.join("\n");
 }
 
-// Ask OpenAI to produce a short, neat, translated card
 async function generateCardWithAI({ name, allergens, contact_name, contact_phone, language }) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY");
+  }
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const allergenList = allergens.length ? allergens.join(", ").replace(/_/g, " ") : "none";
 
+  const allergenList = allergens.length ? allergens.join(", ").replace(/_/g, " ") : "none";
   const prompt = `
 You are an expert translator and accessibility writer.
 Write a SHORT emergency allergy card in ${language} with clear lines.
@@ -83,7 +76,6 @@ Use the following fields. Keep it concise and friendly, no extra commentary.
 Output plain text only. Use line breaks. Do not add quotes or markdown.
 `;
 
-  // Use a small-cheap model (adjust if needed)
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [{ role: "user", content: prompt }],
@@ -96,18 +88,22 @@ Output plain text only. Use line breaks. Do not add quotes or markdown.
 }
 
 function buildTransporter() {
-  const port = Number(process.env.SMTP_PORT || 587);
-  const secure = port === 465; // true for 465, false for 587
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
+    throw new Error("Missing SMTP envs (SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS).");
+  }
 
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+  const port = Number(SMTP_PORT);
+  const secure = port === 465;
+
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
     port,
     secure,
-    auth: {
-      user: process.env.SMTP_USER, // for Brevo, this should be 'apikey'
-      pass: process.env.SMTP_PASS, // for Brevo, this is your xkeysib_... API key
-    },
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
+
+  return transporter;
 }
 
 export default async function handler(req, res) {
@@ -120,8 +116,9 @@ export default async function handler(req, res) {
     }
 
     const body = req.body || {};
+    // Log a sanitized snapshot (no secrets)
+    console.log("Incoming body keys:", Object.keys(body));
 
-    // Collect & normalize fields
     const clean = {
       email: String(body.email || "").trim(),
       name: String(body.name || "").trim(),
@@ -131,26 +128,37 @@ export default async function handler(req, res) {
       allergens: normalizeAllergensFromBody(body),
     };
 
-    // Basic validation (return 400 instead of 500)
     if (!clean.email || !clean.name) {
       return res.status(400).json({
         ok: false,
         error: "Missing required fields: name, email",
-        received: { email: clean.email, name: clean.name },
+        received: { email: !!clean.email, name: !!clean.name },
       });
     }
 
-    // Generate the card text with AI (fallback to simple if something goes wrong)
+    // Generate card
     let cardText;
     try {
       cardText = await generateCardWithAI(clean);
     } catch (e) {
-      console.error("OpenAI failed, using fallback. Reason:", e?.message);
+      console.error("OpenAI error:", e?.message);
       cardText = fallbackCard(clean);
     }
 
-    // Send email
+    // Build & verify SMTP
     const transporter = buildTransporter();
+    try {
+      await transporter.verify();
+      console.log("SMTP verify OK");
+    } catch (e) {
+      console.error("SMTP verify failed:", e?.message);
+      throw new Error("SMTP auth failed: " + (e?.message || "unknown"));
+    }
+
+    // Compose email
+    const from = process.env.EMAIL_FROM;
+    if (!from) throw new Error("Missing EMAIL_FROM (must be a verified sender in Brevo).");
+
     const subject = `Allergy Card for ${clean.name}`;
     const html = `
       <div style="font-family:system-ui,Arial,sans-serif;white-space:pre-wrap;line-height:1.45">
@@ -159,7 +167,7 @@ export default async function handler(req, res) {
     `;
 
     await transporter.sendMail({
-      from: process.env.EMAIL_FROM,   // must be a verified sender in Brevo
+      from,
       to: clean.email,
       subject,
       text: cardText,
@@ -168,7 +176,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true, emailed_to: clean.email });
   } catch (err) {
-    console.error("SERVER ERROR:", err);
-    return res.status(500).json({ ok: false, error: "Internal error" });
+    console.error("SERVER ERROR:", err?.message, err?.stack);
+    // Return the message so we can see it in tools like Hoppscotch, and it will
+    // appear in Vercel Runtime Logs too.
+    return res.status(500).json({ ok: false, error: err?.message || "Internal error" });
   }
 }
