@@ -1,97 +1,98 @@
-import { readFile } from "fs/promises";
+import OpenAI from "openai";
 import nodemailer from "nodemailer";
 
 export const config = { runtime: "nodejs" };
 
-// language map (template filenames + strings)
-const LANGS = {
-  en: { template: "template-en.png", emergency: "Emergency Contact:", subject: "Your Allergy Card", emailLine: (n)=>`Hi ${n||"there"}, your allergy card is ready.` },
-  fr: { template: "template-fr.png", emergency: "Contact d’urgence :", subject: "Votre carte d’allergies", emailLine: (n)=>`Bonjour ${n||""}, votre carte d’allergies est prête.` },
-  es: { template: "template-es.png", emergency: "Contacto de emergencia:", subject: "Tu tarjeta de alergias", emailLine: (n)=>`Hola ${n||""}, tu tarjeta de alergias está lista.` },
-  pt: { template: "template-pt.png", emergency: "Contacto de emergência:", subject: "Seu cartão de alergias", emailLine: (n)=>`Olá ${n||""}, seu cartão de alergias está pronto.` },
-  zh: { template: "template-zh.png", emergency: "紧急联系人：", subject: "过敏卡已生成", emailLine: ()=>"您的过敏卡已生成。" }
-};
+// languages you'll accept from the form
+const SUPPORTED = new Set(["en", "fr", "es", "pt", "zh"]);
 
-// X mark positions (adjust if needed to match your PNGs)
-const marks = {
-  eggs:        { x: 170, y: 250 },
-  dairy:       { x: 520, y: 250 },
-  peanuts:     { x: 870, y: 250 },
-  tree_nuts:   { x: 170, y: 380 },
-  shellfish:   { x: 520, y: 380 },
-  soy:         { x: 870, y: 380 }
-};
+function buildPrompt({ language, name, allergens, contact_name, contact_phone }) {
+  const lang = SUPPORTED.has((language || "").toLowerCase()) ? language.toLowerCase() : "en";
+  const list = Array.isArray(allergens)
+    ? allergens
+    : String(allergens || "").split(",").map(s => s.trim()).filter(Boolean);
 
-function buildOverlaySVG({ width, height, name, allergens, emergencyText }) {
-  const xs = Object.entries(marks).map(([k, p]) =>
-    allergens.includes(k)
-      ? `<text x="${p.x}" y="${p.y}" font-family="Arial, sans-serif" font-weight="700" font-size="64" fill="#111">✖</text>`
-      : ""
-  ).join("");
+  return `
+Write a 4-line "allergy card" in ${lang}. Use short, clear, polite language. No emojis.
+Format with **bold** for the name and the "Emergency Contact" label.
 
-  return Buffer.from(`
-    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <text x="${width/2}" y="95" text-anchor="middle"
-            font-family="Arial, sans-serif" font-weight="700" font-size="72" fill="#111">
-        ${String(name||"").toUpperCase()}
-      </text>
-      ${xs}
-      <text x="125" y="${height-45}"
-            font-family="Arial, sans-serif"
-            font-weight="700" font-size="40" fill="#fff">
-        ${emergencyText}
-      </text>
-    </svg>
-  `);
+Lines to include (exactly these ideas):
+1) **${name || "Name not provided"}**
+2) A sentence: "I am severely allergic to: ${list.length ? list.join(", ") : "several foods"}."
+3) A sentence: "Do not feed me foods containing these allergens."
+4) **Emergency Contact:** ${contact_name || "N/A"} — ${contact_phone || "N/A"}
+
+If allergens are English, translate the food names naturally into ${lang}.
+Return only the final card (no extra commentary).
+`;
 }
 
 export default async function handler(req, res) {
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
+    // env vars
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     const SMTP_HOST = process.env.SMTP_HOST;
     const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
     const SMTP_USER = process.env.SMTP_USER;
     const SMTP_PASS = process.env.SMTP_PASS;
     const EMAIL_FROM = process.env.EMAIL_FROM;
 
+    if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, message: "Missing OPENAI_API_KEY" });
     if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM) {
-      return res.status(500).json({ ok:false, message:"Missing SMTP env vars" });
+      return res.status(500).json({ ok: false, message: "Missing SMTP env vars" });
     }
 
-    let { email="", name="", allergens=[], contact_name="", contact_phone="", language="en" } = req.body || {};
-    if (!email) return res.status(400).json({ ok:false, message:"Missing recipient email" });
+    // request body
+    let {
+      email = "",
+      name = "",
+      allergens = [],
+      contact_name = "",
+      contact_phone = "",
+      language = "en"
+    } = req.body || {};
 
-    const L = LANGS[(language||"en").toLowerCase()] ? (language||"en").toLowerCase() : "en";
-    const list = Array.isArray(allergens)
-      ? allergens
-      : String(allergens).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (!email) return res.status(400).json({ ok: false, message: "Missing recipient email" });
 
-    // Load base PNG from /assets
-    const tplUrl = new URL(`../assets/${LANGS[L].template}`, import.meta.url);
-    const basePng = await readFile(tplUrl);
+    // --- AI: write/translate the allergy card text ---
+    const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+    const prompt = buildPrompt({ language, name, allergens, contact_name, contact_phone });
 
-    // Read PNG width/height from header (IHDR) to size overlay
-    const width = basePng.readUInt32BE(16);
-    const height = basePng.readUInt32BE(20);
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [{ role: "user", content: prompt }]
+    });
 
-    // Build overlay SVG
-    const emergencyText = `${LANGS[L].emergency} ${contact_name} ${contact_phone}`;
-    const overlay = buildOverlaySVG({ width, height, name, allergens: list, emergencyText });
+    const cardText =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      "Allergy card could not be generated.";
 
-    // Send via Brevo SMTP (Nodemailer)
+    // --- Email via Brevo SMTP (Nodemailer) ---
     const transporter = nodemailer.createTransport({
       host: SMTP_HOST,
       port: SMTP_PORT,
-      secure: false,
+      secure: false, // STARTTLS on 587
       auth: { user: SMTP_USER, pass: SMTP_PASS }
     });
 
-    const subject = LANGS[L].subject;
+    const subjectMap = {
+      en: "Your Allergy Card",
+      fr: "Votre carte d’allergies",
+      es: "Tu tarjeta de alergias",
+      pt: "Seu cartão de alergias",
+      zh: "您的过敏卡"
+    };
+    const L = SUPPORTED.has((language || "").toLowerCase()) ? language.toLowerCase() : "en";
+    const subject = subjectMap[L] || subjectMap.en;
+
     const html = `
-      <div style="font-family:Arial,sans-serif;line-height:1.45">
-        <p>${LANGS[L].emailLine(name)}</p>
-        <p>Attached: the base PNG template and the overlay SVG with your details.</p>
+      <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.5">
+        <p>Here is your AI-generated allergy card:</p>
+        <pre style="white-space:pre-wrap;font-family:inherit;background:#f6f7f9;padding:12px;border-radius:8px">${cardText}</pre>
+        <p style="margin-top:14px;color:#666">Tip: save this to Notes or print it to keep on hand.</p>
       </div>
     `;
 
@@ -99,15 +100,11 @@ export default async function handler(req, res) {
       from: EMAIL_FROM,
       to: email,
       subject,
-      html,
-      attachments: [
-        { filename: `template-${L}.png`, content: basePng, contentType: "image/png" },
-        { filename: `overlay-${L}.svg`, content: overlay, contentType: "image/svg+xml" }
-      ]
+      html
     });
 
-    return res.status(200).json({ ok:true, emailed_to: email, messageId: info?.messageId || null });
+    return res.status(200).json({ ok: true, emailed_to: email, messageId: info?.messageId || null });
   } catch (e) {
-    return res.status(500).json({ ok:false, message: e?.message || "failed" });
+    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
   }
 }
