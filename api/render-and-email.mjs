@@ -1,110 +1,174 @@
-import OpenAI from "openai";
+// api/render-and-email.mjs
 import nodemailer from "nodemailer";
+import OpenAI from "openai";
 
-export const config = { runtime: "nodejs" };
+// ---------- CONFIG ----------
+const KNOWN_ALLERGENS = ["eggs", "dairy", "peanuts", "tree_nuts", "shellfish", "soy"];
+const SUPPORTED_LANGS = ["en", "fr", "es", "pt", "zh"];
 
-// languages you'll accept from the form
-const SUPPORTED = new Set(["en", "fr", "es", "pt", "zh"]);
+// Optional: allow browser-based testing tools (Hoppscotch etc.)
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
 
-function buildPrompt({ language, name, allergens, contact_name, contact_phone }) {
-  const lang = SUPPORTED.has((language || "").toLowerCase()) ? language.toLowerCase() : "en";
-  const list = Array.isArray(allergens)
-    ? allergens
-    : String(allergens || "").split(",").map(s => s.trim()).filter(Boolean);
+// Helpers to keep things safe
+function normalizeAllergensFromBody(body) {
+  // 1) If we directly have "allergens" as array or string
+  const direct = body?.allergens;
 
-  return `
-Write a 4-line "allergy card" in ${lang}. Use short, clear, polite language. No emojis.
-Format with **bold** for the name and the "Emergency Contact" label.
+  // Accept array or comma-separated string
+  if (Array.isArray(direct)) {
+    const norm = direct
+      .map(s => String(s).trim().toLowerCase().replace(/\s+/g, "_"))
+      .filter(v => KNOWN_ALLERGENS.includes(v));
+    if (norm.length) return norm;
+  }
+  if (typeof direct === "string") {
+    const norm = direct
+      .split(",")
+      .map(s => s.trim().toLowerCase().replace(/\s+/g, "_"))
+      .filter(v => KNOWN_ALLERGENS.includes(v));
+    if (norm.length) return norm;
+  }
 
-Lines to include (exactly these ideas):
-1) **${name || "Name not provided"}**
-2) A sentence: "I am severely allergic to: ${list.length ? list.join(", ") : "several foods"}."
-3) A sentence: "Do not feed me foods containing these allergens."
-4) **Emergency Contact:** ${contact_name || "N/A"} — ${contact_phone || "N/A"}
+  // 2) Gather “checkbox per allergen” pattern:
+  // e.g. allergens_eggs: "on", allergens_dairy: "on"
+  const fields = body || {};
+  const fromCheckboxes = Object.keys(fields)
+    .filter(k => k.startsWith("allergens_") && fields[k]) // truthy means checked
+    .map(k => k.replace("allergens_", "").toLowerCase());
 
-If allergens are English, translate the food names naturally into ${lang}.
-Return only the final card (no extra commentary).
+  const cleanFromCheckboxes = fromCheckboxes
+    .map(v => v.replace(/\s+/g, "_"))
+    .filter(v => KNOWN_ALLERGENS.includes(v));
+
+  return cleanFromCheckboxes;
+}
+
+function normalizeLanguage(lang) {
+  const v = String(lang || "").trim().toLowerCase();
+  return SUPPORTED_LANGS.includes(v) ? v : "en";
+}
+
+// Build a simple fallback card if OpenAI fails for any reason
+function fallbackCard({ name, allergens, contact_name, contact_phone, language }) {
+  const allergenList =
+    allergens.length ? allergens.join(", ").replace(/_/g, " ") : "None specified";
+  const lines = [
+    `Name: ${name}`,
+    `I am severely allergic to: ${allergenList}`,
+    `Please DO NOT serve me food containing these allergens.`,
+    `Emergency Contact: ${contact_name} ${contact_phone ? `(${contact_phone})` : ""}`.trim(),
+    `Language: ${language.toUpperCase()}`
+  ];
+  return lines.join("\n");
+}
+
+// Ask OpenAI to produce a short, neat, translated card
+async function generateCardWithAI({ name, allergens, contact_name, contact_phone, language }) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const allergenList = allergens.length ? allergens.join(", ").replace(/_/g, " ") : "none";
+
+  const prompt = `
+You are an expert translator and accessibility writer.
+Write a SHORT emergency allergy card in ${language} with clear lines.
+Use the following fields. Keep it concise and friendly, no extra commentary.
+- Name: ${name}
+- Allergens: ${allergenList}
+- Instruction: "Please DO NOT serve me food containing these allergens."
+- Emergency Contact: ${contact_name}${contact_phone ? ` (${contact_phone})` : ""}
+
+Output plain text only. Use line breaks. Do not add quotes or markdown.
 `;
+
+  // Use a small-cheap model (adjust if needed)
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.3,
+  });
+
+  const text = response?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("OpenAI returned empty content");
+  return text;
+}
+
+function buildTransporter() {
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = port === 465; // true for 465, false for 587
+
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port,
+    secure,
+    auth: {
+      user: process.env.SMTP_USER, // for Brevo, this should be 'apikey'
+      pass: process.env.SMTP_PASS, // for Brevo, this is your xkeysib_... API key
+    },
+  });
 }
 
 export default async function handler(req, res) {
+  setCors(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-
-    // env vars
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    const SMTP_HOST = process.env.SMTP_HOST;
-    const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-    const SMTP_USER = process.env.SMTP_USER;
-    const SMTP_PASS = process.env.SMTP_PASS;
-    const EMAIL_FROM = process.env.EMAIL_FROM;
-
-    if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, message: "Missing OPENAI_API_KEY" });
-    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !EMAIL_FROM) {
-      return res.status(500).json({ ok: false, message: "Missing SMTP env vars" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "POST only" });
     }
 
-    // request body
-    let {
-      email = "",
-      name = "",
-      allergens = [],
-      contact_name = "",
-      contact_phone = "",
-      language = "en"
-    } = req.body || {};
+    const body = req.body || {};
 
-    if (!email) return res.status(400).json({ ok: false, message: "Missing recipient email" });
-
-    // --- AI: write/translate the allergy card text ---
-    const client = new OpenAI({ apiKey: OPENAI_API_KEY });
-    const prompt = buildPrompt({ language, name, allergens, contact_name, contact_phone });
-
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      messages: [{ role: "user", content: prompt }]
-    });
-
-    const cardText =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "Allergy card could not be generated.";
-
-    // --- Email via Brevo SMTP (Nodemailer) ---
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: false, // STARTTLS on 587
-      auth: { user: SMTP_USER, pass: SMTP_PASS }
-    });
-
-    const subjectMap = {
-      en: "Your Allergy Card",
-      fr: "Votre carte d’allergies",
-      es: "Tu tarjeta de alergias",
-      pt: "Seu cartão de alergias",
-      zh: "您的过敏卡"
+    // Collect & normalize fields
+    const clean = {
+      email: String(body.email || "").trim(),
+      name: String(body.name || "").trim(),
+      contact_name: String(body.contact_name || "").trim(),
+      contact_phone: String(body.contact_phone || "").trim(),
+      language: normalizeLanguage(body.language),
+      allergens: normalizeAllergensFromBody(body),
     };
-    const L = SUPPORTED.has((language || "").toLowerCase()) ? language.toLowerCase() : "en";
-    const subject = subjectMap[L] || subjectMap.en;
 
+    // Basic validation (return 400 instead of 500)
+    if (!clean.email || !clean.name) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing required fields: name, email",
+        received: { email: clean.email, name: clean.name },
+      });
+    }
+
+    // Generate the card text with AI (fallback to simple if something goes wrong)
+    let cardText;
+    try {
+      cardText = await generateCardWithAI(clean);
+    } catch (e) {
+      console.error("OpenAI failed, using fallback. Reason:", e?.message);
+      cardText = fallbackCard(clean);
+    }
+
+    // Send email
+    const transporter = buildTransporter();
+    const subject = `Allergy Card for ${clean.name}`;
     const html = `
-      <div style="font-family:Arial,Helvetica,sans-serif;line-height:1.5">
-        <p>Here is your AI-generated allergy card:</p>
-        <pre style="white-space:pre-wrap;font-family:inherit;background:#f6f7f9;padding:12px;border-radius:8px">${cardText}</pre>
-        <p style="margin-top:14px;color:#666">Tip: save this to Notes or print it to keep on hand.</p>
+      <div style="font-family:system-ui,Arial,sans-serif;white-space:pre-wrap;line-height:1.45">
+        ${cardText.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
       </div>
     `;
 
-    const info = await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: email,
+    await transporter.sendMail({
+      from: process.env.EMAIL_FROM,   // must be a verified sender in Brevo
+      to: clean.email,
       subject,
-      html
+      text: cardText,
+      html,
     });
 
-    return res.status(200).json({ ok: true, emailed_to: email, messageId: info?.messageId || null });
-  } catch (e) {
-    return res.status(500).json({ ok: false, message: e?.message || "Server error" });
+    return res.status(200).json({ ok: true, emailed_to: clean.email });
+  } catch (err) {
+    console.error("SERVER ERROR:", err);
+    return res.status(500).json({ ok: false, error: "Internal error" });
   }
 }
